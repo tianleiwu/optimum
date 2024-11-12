@@ -328,8 +328,8 @@ class ORTModel(OptimizedModel):
         validate_provider_availability(provider)
 
         if self.use_io_binding is False and provider == "CUDAExecutionProvider":
-            self.use_io_binding = True
-            logger.info(
+            #self.use_io_binding = True
+            logger.warning(
                 "use_io_binding was set to False with a CUDAExecutionProvider, setting it to True as it can speed up inference. "
                 "It is possible to disable this feature manually by setting the use_io_binding attribute back to False."
             )

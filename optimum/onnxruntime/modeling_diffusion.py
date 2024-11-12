@@ -22,8 +22,11 @@ from collections import OrderedDict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Optional, Tuple, Union
+from timeit import default_timer as timer
 
+import nvtx
 import numpy as np
+import onnxruntime as ort
 import sympy as sp
 import torch
 from diffusers.configuration_utils import ConfigMixin
@@ -51,8 +54,6 @@ from huggingface_hub.utils import validate_hf_hub_args
 from transformers import CLIPFeatureExtractor, CLIPTokenizer
 from transformers.file_utils import add_end_docstrings
 from transformers.modeling_outputs import ModelOutput
-
-import onnxruntime as ort
 
 from ..exporters.onnx import main_export
 from ..onnx.utils import _get_model_external_data_paths
@@ -621,9 +622,16 @@ class ORTPipelinePart(ConfigMixin):
         return resolved_output_shapes
 
     def _prepare_io_binding(self, model_inputs: torch.Tensor) -> Tuple[ort.IOBinding, Dict[str, torch.Tensor]]:
-        io_binding = self.session.io_binding()
+        io_binding_latency_map = {}
 
+        io_start = timer()            
+        io_binding = self.session.io_binding()
+        io_end = timer()
+        io_binding_latency_map["io_bidning"] = io_end - io_start
+
+        i = 0
         for input_name in self.input_names.keys():
+            start = timer() 
             input_dtype = TypeHelper.ort_type_to_torch_type(self.input_dtypes[input_name])
 
             if model_inputs[input_name].dtype != input_dtype:
@@ -637,10 +645,18 @@ class ORTPipelinePart(ConfigMixin):
                 buffer_ptr=model_inputs[input_name].data_ptr(),
                 shape=tuple(model_inputs[input_name].size()),
             )
+            end = timer()
+            io_binding_latency_map[f"input_{i}:{input_name}"] = end - start
+            i =  i + 1
 
+        start = timer()            
         current_output_shapes = self._get_output_shapes(**model_inputs)
+        end = timer()
+        io_binding_latency_map["current_output_shapes"] = end - start
 
+        j = 0
         for output_name in self.output_names.keys():
+            start = timer()            
             output_dtype = TypeHelper.ort_type_to_torch_type(self.output_dtypes[output_name])
             output_shape = current_output_shapes[output_name]
 
@@ -655,6 +671,14 @@ class ORTPipelinePart(ConfigMixin):
                 buffer_ptr=self._output_buffers[output_name].data_ptr(),
                 shape=tuple(self._output_buffers[output_name].size()),
             )
+            end = timer()
+            io_binding_latency_map[f"output_{j}: {output_name}"] = end - start
+            j =  j + 1
+
+        io_end = timer()
+        io_binding_latency_map["total"] = io_end - io_start
+
+        print(f"io binding latency:{io_binding_latency_map}")
 
         return io_binding, model_inputs, self._output_buffers
 
@@ -732,12 +756,23 @@ class ORTModelUnet(ORTPipelinePart):
         }
 
         if self.use_io_binding:
-            io_binding, model_inputs, model_outputs = self._prepare_io_binding(model_inputs)
-            self.session.run_with_iobinding(io_binding)
+            with nvtx.annotate("unet_inputs_io"):
+                start = timer()   
+                io_binding, model_inputs, model_outputs = self._prepare_io_binding(model_inputs)
+                end = timer()
+                print(f"total io binding latency:{end-start}")
+                
+            with nvtx.annotate("unet_io"):
+                self.session.run_with_iobinding(io_binding)
         else:
-            onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
-            onnx_outputs = self.session.run(None, onnx_inputs)
-            model_outputs = self._prepare_onnx_outputs(*onnx_outputs)
+            with nvtx.annotate("unet_inputs"):
+                onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
+
+            with nvtx.annotate("unet_1"):
+                onnx_outputs = self.session.run(None, onnx_inputs)
+
+            with nvtx.annotate("unet_output_1"):
+                model_outputs = self._prepare_onnx_outputs(*onnx_outputs)
 
         if return_dict:
             return model_outputs
