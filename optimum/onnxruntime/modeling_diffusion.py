@@ -22,9 +22,7 @@ from collections import OrderedDict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Optional, Tuple, Union
-from timeit import default_timer as timer
 
-import nvtx
 import numpy as np
 import onnxruntime as ort
 import sympy as sp
@@ -575,7 +573,7 @@ class ORTPipelinePart(ConfigMixin):
 
         return self
 
-    def _get_output_shapes(self, **model_inputs: torch.Tensor) -> Dict[str, int]:
+    def _get_output_shapes(self, **model_inputs: torch.Tensor) -> Dict[str, Tuple[int, ...]]:
         known_symbols = self._known_symbols.copy()
 
         for input_name, compiled_input_shape in self._compiled_input_shapes.items():
@@ -621,17 +619,10 @@ class ORTPipelinePart(ConfigMixin):
 
         return resolved_output_shapes
 
-    def _prepare_io_binding(self, model_inputs: torch.Tensor) -> Tuple[ort.IOBinding, Dict[str, torch.Tensor]]:
-        io_binding_latency_map = {}
-
-        io_start = timer()            
+    def _prepare_io_binding(self, model_inputs: torch.Tensor, output_shapes:Dict[str, Tuple[int, ...]] | None = None) -> Tuple[ort.IOBinding, Dict[str, torch.Tensor]]:
         io_binding = self.session.io_binding()
-        io_end = timer()
-        io_binding_latency_map["io_bidning"] = io_end - io_start
 
-        i = 0
         for input_name in self.input_names.keys():
-            start = timer() 
             input_dtype = TypeHelper.ort_type_to_torch_type(self.input_dtypes[input_name])
 
             if model_inputs[input_name].dtype != input_dtype:
@@ -645,18 +636,13 @@ class ORTPipelinePart(ConfigMixin):
                 buffer_ptr=model_inputs[input_name].data_ptr(),
                 shape=tuple(model_inputs[input_name].size()),
             )
-            end = timer()
-            io_binding_latency_map[f"input_{i}:{input_name}"] = end - start
-            i =  i + 1
 
-        start = timer()            
-        current_output_shapes = self._get_output_shapes(**model_inputs)
-        end = timer()
-        io_binding_latency_map["current_output_shapes"] = end - start
+        if output_shapes is None:   
+            current_output_shapes = self._get_output_shapes(**model_inputs)
+        else:
+            current_output_shapes = output_shapes
 
-        j = 0
         for output_name in self.output_names.keys():
-            start = timer()            
             output_dtype = TypeHelper.ort_type_to_torch_type(self.output_dtypes[output_name])
             output_shape = current_output_shapes[output_name]
 
@@ -671,16 +657,8 @@ class ORTPipelinePart(ConfigMixin):
                 buffer_ptr=self._output_buffers[output_name].data_ptr(),
                 shape=tuple(self._output_buffers[output_name].size()),
             )
-            end = timer()
-            io_binding_latency_map[f"output_{j}: {output_name}"] = end - start
-            j =  j + 1
 
-        io_end = timer()
-        io_binding_latency_map["total"] = io_end - io_start
-
-        print(f"io binding latency:{io_binding_latency_map}")
-
-        return io_binding, model_inputs, self._output_buffers
+        return io_binding, self._output_buffers
 
     def _prepare_onnx_inputs(self, **inputs: Union[torch.Tensor, np.ndarray]) -> Dict[str, np.ndarray]:
         onnx_inputs = {}
@@ -756,23 +734,19 @@ class ORTModelUnet(ORTPipelinePart):
         }
 
         if self.use_io_binding:
-            with nvtx.annotate("unet_inputs_io"):
-                start = timer()   
-                io_binding, model_inputs, model_outputs = self._prepare_io_binding(model_inputs)
-                end = timer()
-                print(f"total io binding latency:{end-start}")
+            # _get_output_shapes is very slow. Here we compute the output shape quickly.
+            output_shape = list(sample.size())
+            output_shape[1] = 4
+            outputs_shape = {next(iter(self.output_names)) : tuple(output_shape)}
+            io_binding, model_outputs = self._prepare_io_binding(model_inputs, outputs_shape)
                 
-            with nvtx.annotate("unet_io"):
-                self.session.run_with_iobinding(io_binding)
+            self.session.run_with_iobinding(io_binding)
         else:
-            with nvtx.annotate("unet_inputs"):
-                onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
+            onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
 
-            with nvtx.annotate("unet_1"):
-                onnx_outputs = self.session.run(None, onnx_inputs)
+            onnx_outputs = self.session.run(None, onnx_inputs)
 
-            with nvtx.annotate("unet_output_1"):
-                model_outputs = self._prepare_onnx_outputs(*onnx_outputs)
+            model_outputs = self._prepare_onnx_outputs(*onnx_outputs)
 
         if return_dict:
             return model_outputs
@@ -791,7 +765,7 @@ class ORTModelTextEncoder(ORTPipelinePart):
         model_inputs = {"input_ids": input_ids}
 
         if self.use_io_binding:
-            io_binding, model_inputs, model_outputs = self._prepare_io_binding(model_inputs)
+            io_binding, model_outputs = self._prepare_io_binding(model_inputs)
             self.session.run_with_iobinding(io_binding)
         else:
             onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
@@ -834,7 +808,7 @@ class ORTModelVaeEncoder(ORTPipelinePart):
         model_inputs = {"sample": sample}
 
         if self.use_io_binding:
-            io_binding, model_inputs, model_outputs = self._prepare_io_binding(model_inputs)
+            io_binding, model_outputs = self._prepare_io_binding(model_inputs)
             self.session.run_with_iobinding(io_binding)
         else:
             onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
@@ -876,7 +850,7 @@ class ORTModelVaeDecoder(ORTPipelinePart):
         model_inputs = {"latent_sample": latent_sample}
 
         if self.use_io_binding:
-            io_binding, model_inputs, model_outputs = self._prepare_io_binding(model_inputs)
+            io_binding, model_outputs = self._prepare_io_binding(model_inputs)
             self.session.run_with_iobinding(io_binding)
         else:
             onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
