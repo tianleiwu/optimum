@@ -23,6 +23,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Optional, Tuple, Union
 
+import nvtx
 import numpy as np
 import onnxruntime as ort
 import sympy as sp
@@ -237,6 +238,7 @@ class ORTDiffusionPipeline(ORTModel, DiffusionPipeline):
             component.to(*args, **kwargs)
         return self
 
+    @nvtx.annotate(message="ORTDiffusionPipeline.call")
     def __call__(self, *args, **kwargs):
         # we do this to keep numpy random states support for now
         # TODO: deprecate and add warnings when a random state is passed
@@ -707,6 +709,7 @@ class ORTModelUnet(ORTPipelinePart):
             )
             self.register_to_config(time_cond_proj_dim=None)
 
+    @nvtx.annotate(message="Unet.forward")
     def forward(
         self,
         sample: Union[np.ndarray, torch.Tensor],
@@ -734,19 +737,24 @@ class ORTModelUnet(ORTPipelinePart):
         }
 
         if self.use_io_binding:
-            # _get_output_shapes is very slow. Here we compute the output shape quickly.
-            output_shape = list(sample.size())
-            output_shape[1] = 4
-            outputs_shape = {next(iter(self.output_names)) : tuple(output_shape)}
-            io_binding, model_outputs = self._prepare_io_binding(model_inputs, outputs_shape)
+            with nvtx.annotate("unet_inputs"):
+                # _get_output_shapes is very slow. Here we compute the output shape quickly.
+                output_shape = list(sample.size())
+                output_shape[1] = 4
+                outputs_shape = {next(iter(self.output_names)) : tuple(output_shape)}
+                io_binding, model_outputs = self._prepare_io_binding(model_inputs, outputs_shape)
                 
-            self.session.run_with_iobinding(io_binding)
+            with nvtx.annotate("unet_io"):
+                self.session.run_with_iobinding(io_binding)
         else:
-            onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
+            with nvtx.annotate("unet_inputs"):
+                onnx_inputs = self._prepare_onnx_inputs(**model_inputs)
 
-            onnx_outputs = self.session.run(None, onnx_inputs)
+            with nvtx.annotate("unet"):
+                onnx_outputs = self.session.run(None, onnx_inputs)
 
-            model_outputs = self._prepare_onnx_outputs(*onnx_outputs)
+            with nvtx.annotate("unet_output"):
+                model_outputs = self._prepare_onnx_outputs(*onnx_outputs)
 
         if return_dict:
             return model_outputs
@@ -799,6 +807,7 @@ class ORTModelVaeEncoder(ORTPipelinePart):
             )
             self.register_to_config(scaling_factor=0.18215)
 
+    @nvtx.annotate(message="VaeEncoder.forward")
     def forward(
         self,
         sample: Union[np.ndarray, torch.Tensor],
@@ -841,6 +850,7 @@ class ORTModelVaeDecoder(ORTPipelinePart):
             )
             self.register_to_config(scaling_factor=0.18215)
 
+    @nvtx.annotate(message="VaeDecoder.forward")
     def forward(
         self,
         latent_sample: Union[np.ndarray, torch.Tensor],
